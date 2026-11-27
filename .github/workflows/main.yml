@@ -1,0 +1,136 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths: [index.html, .github/workflows/build-apk.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Prepare Capacitor project
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+          cat > package.json <<'EOF'
+          {
+            "name": "adhkar-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^6.0.0",
+              "@capacitor/cli": "^6.0.0",
+              "@capacitor/core": "^6.0.0",
+              "@capacitor/local-notifications": "^6.0.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.adhkar.hisn",
+            "appName": "حصن الأذكار",
+            "webDir": "www",
+            "backgroundColor": "#0E2A2B",
+            "plugins": {
+              "LocalNotifications": {
+                "smallIcon": "ic_stat_adhkar",
+                "iconColor": "#D9B565"
+              }
+            }
+          }
+          EOF
+          npm install
+          npx cap add android
+
+      - name: Customize Android project (icon, permissions, splash)
+        run: |
+          RES=android/app/src/main/res
+          MF=android/app/src/main/AndroidManifest.xml
+
+          # status-bar icon (white crescent)
+          mkdir -p $RES/drawable
+          cat > $RES/drawable/ic_stat_adhkar.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M9.5,2c-1.82,0 -3.53,0.5 -5,1.35c2.99,1.73 5,4.95 5,8.65s-2.01,6.92 -5,8.65c1.47,0.85 3.18,1.35 5,1.35c5.52,0 10,-4.48 10,-10S15.02,2 9.5,2z"/>
+          </vector>
+          EOF
+
+          # launcher icon: reuse the icon embedded in index.html
+          python3 - <<'PY'
+          import re, base64
+          s = open("index.html", encoding="utf-8").read()
+          m = re.search(r'<div id="boot"><img[^>]*src="data:image/png;base64,([A-Za-z0-9+/=]+)"', s)
+          if m:
+              open("icon.png", "wb").write(base64.b64decode(m.group(1)))
+              print("icon extracted")
+          else:
+              print("icon not found, keeping default")
+          PY
+          if [ -f icon.png ]; then
+            for d in $RES/mipmap-*dpi; do
+              for n in ic_launcher ic_launcher_round ic_launcher_foreground; do
+                cp icon.png "$d/$n.png"
+              done
+            done
+            rm -rf $RES/mipmap-anydpi-v26
+          fi
+
+          # splash background = app background (instead of the Capacitor logo)
+          sed -i 's|@drawable/splash|#0E2A2B|' $RES/values/styles.xml || true
+
+          # permissions
+          python3 - <<'PY'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          perms = ["android.permission.POST_NOTIFICATIONS",
+                   "android.permission.SCHEDULE_EXACT_ALARM",
+                   "android.permission.RECEIVE_BOOT_COMPLETED",
+                   "android.permission.VIBRATE"]
+          add = "".join('    <uses-permission android:name="%s" />\n' % x for x in perms if x not in s)
+          s = s.replace("<application", add + "    <application", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+
+      - name: Build debug APK
+        run: |
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Collect APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk hisn-alazkar.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hisn-alazkar-apk
+          path: hisn-alazkar.apk
+
+      - name: Publish APK in Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" hisn-alazkar.apk \
+            --title "APK #${{ github.run_number }}" \
+            --notes "حمّل ملف hisn-alazkar.apk وثبّته على الموبايل." \
+            --target "${{ github.sha }}"
